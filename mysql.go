@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	"github.com/coredns/coredns/plugin"
-	"github.com/prometheus/client_golang/prometheus"
 
 	clog "github.com/coredns/coredns/plugin/pkg/log"
 	"github.com/coredns/coredns/request"
@@ -83,7 +82,7 @@ func (m *Mysql) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) 
 			}
 		}
 	}
-	// Process records
+	// Process records and collect glue records
 	for _, record := range records {
 		rrString := fmt.Sprintf("%s %d IN %s %s", record.fqdn, record.ttl, record.qType, record.data)
 		rr, err := m.makeAnswer(rrString)
@@ -93,22 +92,17 @@ func (m *Mysql) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) 
 		answers = append(answers, rr)
 		rrStrings = append(rrStrings, rrString)
 
-		// Handle NS records
+		// Handle NS records - collect glue records
 		if rr.Header().Rrtype == dns.TypeNS {
 			ns := rr.(*dns.NS).Ns
-
-			// NEW: Completely separate lookup for glue records
-			// First get the nameserver's zone info
 			if nsZoneID, nsHost, nsZone, err := m.getDomainInfo(ns); err == nil {
-				// NEW: Directly query for A/AAAA records without relation to original query
 				glueRecords, err := m.getRecords(nsZoneID, nsHost, nsZone, "")
 				if err == nil {
 					for _, glueRec := range glueRecords {
-						// Only include A/AAAA records
 						if glueRec.qType == "A" || glueRec.qType == "AAAA" {
 							glueRRString := fmt.Sprintf("%s %d IN %s %s",
 								glueRec.fqdn,
-								glueRec.ttl, // Use the record's own TTL
+								glueRec.ttl,
 								glueRec.qType,
 								glueRec.data)
 							glueRR, err := m.makeAnswer(glueRRString)
@@ -150,39 +144,38 @@ func (m *Mysql) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) 
 	}
 
 	// Common Entrypoint
-	if len(answers) > zero {
+	if len(answers) > 0 {
 		msg := MakeMessage(r, answers)
-		// NEW: Add glue records to the additional section
-		msg.Extra = extras
-		err = w.WriteMsg(msg)
-		if err != nil {
-			logger.Error(err)
+		msg.Extra = extras // Include glue records
+
+		// Store both answers and extras in cache
+		dnsRecordInfo := dnsRecordInfo{
+			rrStrings: rrStrings,
+			response:  append(answers, extras...), // Cache complete response
 		}
-		dnsRecordInfo := dnsRecordInfo{rrStrings: rrStrings, response: answers}
+
 		if cacheDnsRecordResponse, ok := m.degradeQuery(degradeRecord); !ok || !reflect.DeepEqual(cacheDnsRecordResponse, dnsRecordInfo.response) {
 			m.degradeWrite(degradeRecord, dnsRecordInfo)
 			logger.Debugf("CommonEntrypoint Add degrade record %#v, dnsRecordInfo %#v", degradeRecord, dnsRecordInfo)
-			degradeCacheCount.With(prometheus.Labels{"status": "success", "option": "update", "fqdn": degradeRecord.fqdn, "qtype": degradeRecord.qType}).Inc()
-			return dns.RcodeSuccess, nil
 		}
-		return dns.RcodeSuccess, nil
-	}
 
-	logger.Debug("Call next plugin")
-	return plugin.NextOrFailure(m.Name(), m.Next, ctx, w, r)
-
-	// Degrade Entrypoint
-DegradeEntrypoint:
-	if answers, ok := m.degradeQuery(degradeRecord); ok {
-		msg := MakeMessage(r, answers)
 		err = w.WriteMsg(msg)
 		if err != nil {
 			logger.Error(err)
 		}
-		logger.Debugf("DegradeEntrypoint: Query degrade record %#v", degradeRecord)
 		return dns.RcodeSuccess, nil
 	}
-	logger.Debug("Call next plugin")
-	callNextPluginCount.With(prometheus.Labels{"fqdn": qName, "qtype": qType}).Inc()
+
+	// Degrade Entrypoint
+DegradeEntrypoint:
+	if cached, ok := m.degradeQuery(degradeRecord); ok {
+		msg := MakeMessage(r, cached[:len(cached)-len(extras)]) // Answers
+		msg.Extra = cached[len(cached)-len(extras):]            // Extras
+		err = w.WriteMsg(msg)
+		if err != nil {
+			logger.Error(err)
+		}
+		return dns.RcodeSuccess, nil
+	}
 	return plugin.NextOrFailure(m.Name(), m.Next, ctx, w, r)
 }
