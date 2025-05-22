@@ -27,7 +27,6 @@ func (m *Mysql) getDomainInfo(fqdn string) (int, string, string, error) {
 		zone  = fqdn
 		items = strings.Split(zone, zoneSeparator)
 	)
-
 	// Only should case once but more. TODO
 	for i := range items {
 		zone = strings.Join(items[i:], zoneSeparator)
@@ -59,29 +58,29 @@ func (m *Mysql) getBaseZone(fqdn string) string {
 	return rootZone
 }
 
-func (m *Mysql) degradeQuery(record record) ([]dns.RR, bool) {
+// Updated degradeQuery method to work with new dnsRecordInfo structure
+func (m *Mysql) degradeQuery(record record) (dnsRecordInfo, bool) {
 	dnsRecordInfo, ok := m.degradeCache[record]
 	if !ok {
 		degradeCacheCount.With(prometheus.Labels{"option": "query", "status": "fail", "fqdn": record.fqdn, "qtype": record.qType}).Inc()
 	} else {
 		degradeCacheCount.With(prometheus.Labels{"option": "query", "status": "success", "fqdn": record.fqdn, "qtype": record.qType}).Inc()
 	}
-	return dnsRecordInfo.response, ok
+	return dnsRecordInfo, ok
 }
 
+// Updated degradeWrite method remains the same since it already takes dnsRecordInfo
 func (m *Mysql) degradeWrite(record record, dnsRecordInfo dnsRecordInfo) {
 	m.degradeCache[record] = dnsRecordInfo
 }
 
 func (m *Mysql) getRecords(zoneID int, host, zone, qType string) ([]record, error) {
 	var records []record
-
 	rows, err := m.db.Query(m.queryRecordSQL, zoneID, host, qType)
 	if err != nil {
 		logger.Errorf("Query record error: %s", err)
 		return nil, err
 	}
-
 	for rows.Next() {
 		var record record
 		err := rows.Scan(&record.id, &record.zoneID, &record.name, &record.qType, &record.data, &record.ttl)

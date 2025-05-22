@@ -68,31 +68,50 @@ func (m *Mysql) loadLocalData() {
 	if err != nil {
 		logger.Errorf("Failed to load data from file: %s", err)
 		loadLocalData.With(prometheus.Labels{"status": "fail"}).Inc()
-
 		return
 	}
 	err = json.Unmarshal(content, &pureRecords)
 	if err != nil {
 		logger.Errorf("Failed to load data from file: %s", err)
 		loadLocalData.With(prometheus.Labels{"status": "fail"}).Inc()
-
 		return
 	}
 
 	for _, rMap := range pureRecords {
 		for queryKey, rrStrings := range rMap {
-			var response []dns.RR
+			var answers []dns.RR
+			var extras []dns.RR
 			queryKeySlice := strings.Split(queryKey, keySeparator)
 			fqdn, qType := queryKeySlice[0], queryKeySlice[1]
 			record := record{fqdn: fqdn, qType: qType}
+
 			for _, rrString := range rrStrings {
 				rr, err := dns.NewRR(rrString)
 				if err != nil {
 					continue
 				}
-				response = append(response, rr)
+
+				// Parse the RR string to determine if it's a glue record
+				// Glue records are typically A/AAAA records that don't match the query name
+				if rr.Header().Rrtype == dns.TypeA || rr.Header().Rrtype == dns.TypeAAAA {
+					// If the RR name doesn't match the query name, it's likely a glue record
+					if strings.ToLower(rr.Header().Name) != strings.ToLower(fqdn) {
+						extras = append(extras, rr)
+					} else {
+						answers = append(answers, rr)
+					}
+				} else {
+					// Non-A/AAAA records go to answers
+					answers = append(answers, rr)
+				}
 			}
-			dnsRecordInfo := dnsRecordInfo{rrStrings: rrStrings, response: response}
+
+			// Create new dnsRecordInfo with separated answers and extras
+			dnsRecordInfo := dnsRecordInfo{
+				rrStrings: rrStrings,
+				answers:   answers,
+				extras:    extras,
+			}
 			cache[record] = dnsRecordInfo
 		}
 	}

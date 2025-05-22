@@ -82,6 +82,7 @@ func (m *Mysql) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) 
 			}
 		}
 	}
+
 	// Process records and collect glue records
 	for _, record := range records {
 		rrString := fmt.Sprintf("%s %d IN %s %s", record.fqdn, record.ttl, record.qType, record.data)
@@ -95,24 +96,45 @@ func (m *Mysql) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) 
 		// Handle NS records - collect glue records
 		if rr.Header().Rrtype == dns.TypeNS {
 			ns := rr.(*dns.NS).Ns
+			logger.Debugf("Looking for glue records for NS: %s", ns)
 			if nsZoneID, nsHost, nsZone, err := m.getDomainInfo(ns); err == nil {
-				glueRecords, err := m.getRecords(nsZoneID, nsHost, nsZone, "")
+				// Query for A and AAAA records specifically
+				aRecords, err := m.getRecords(nsZoneID, nsHost, nsZone, "A")
 				if err == nil {
-					for _, glueRec := range glueRecords {
-						if glueRec.qType == "A" || glueRec.qType == "AAAA" {
-							glueRRString := fmt.Sprintf("%s %d IN %s %s",
-								glueRec.fqdn,
-								glueRec.ttl,
-								glueRec.qType,
-								glueRec.data)
-							glueRR, err := m.makeAnswer(glueRRString)
-							if err == nil {
-								extras = append(extras, glueRR)
-								rrStrings = append(rrStrings, glueRRString)
-							}
+					for _, glueRec := range aRecords {
+						glueRRString := fmt.Sprintf("%s %d IN %s %s",
+							glueRec.fqdn,
+							glueRec.ttl,
+							glueRec.qType,
+							glueRec.data)
+						glueRR, err := m.makeAnswer(glueRRString)
+						if err == nil {
+							extras = append(extras, glueRR)
+							rrStrings = append(rrStrings, glueRRString)
+							logger.Debugf("Added A glue record: %s", glueRRString)
 						}
 					}
 				}
+
+				// Also check for AAAA records
+				aaaaRecords, err := m.getRecords(nsZoneID, nsHost, nsZone, "AAAA")
+				if err == nil {
+					for _, glueRec := range aaaaRecords {
+						glueRRString := fmt.Sprintf("%s %d IN %s %s",
+							glueRec.fqdn,
+							glueRec.ttl,
+							glueRec.qType,
+							glueRec.data)
+						glueRR, err := m.makeAnswer(glueRRString)
+						if err == nil {
+							extras = append(extras, glueRR)
+							rrStrings = append(rrStrings, glueRRString)
+							logger.Debugf("Added AAAA glue record: %s", glueRRString)
+						}
+					}
+				}
+			} else {
+				logger.Debugf("Could not get domain info for NS %s: %v", ns, err)
 			}
 		}
 	}
@@ -148,17 +170,23 @@ func (m *Mysql) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) 
 		msg := MakeMessage(r, answers)
 		msg.Extra = extras // Include glue records
 
-		// Store both answers and extras in cache
+		// Store answers and extras separately in cache
 		dnsRecordInfo := dnsRecordInfo{
 			rrStrings: rrStrings,
-			response:  append(answers, extras...), // Cache complete response
+			answers:   answers,
+			extras:    extras,
 		}
 
-		if cacheDnsRecordResponse, ok := m.degradeQuery(degradeRecord); !ok || !reflect.DeepEqual(cacheDnsRecordResponse, dnsRecordInfo.response) {
+		// Check if cache needs updating
+		if cacheDnsRecordResponse, ok := m.degradeQuery(degradeRecord); !ok ||
+			!reflect.DeepEqual(cacheDnsRecordResponse.answers, dnsRecordInfo.answers) ||
+			!reflect.DeepEqual(cacheDnsRecordResponse.extras, dnsRecordInfo.extras) {
 			m.degradeWrite(degradeRecord, dnsRecordInfo)
-			logger.Debugf("CommonEntrypoint Add degrade record %#v, dnsRecordInfo %#v", degradeRecord, dnsRecordInfo)
+			logger.Debugf("CommonEntrypoint Add degrade record %#v, answers: %d, extras: %d",
+				degradeRecord, len(dnsRecordInfo.answers), len(dnsRecordInfo.extras))
 		}
 
+		logger.Debugf("Sending response with %d answers and %d extras", len(answers), len(extras))
 		err = w.WriteMsg(msg)
 		if err != nil {
 			logger.Error(err)
@@ -169,8 +197,9 @@ func (m *Mysql) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) 
 	// Degrade Entrypoint
 DegradeEntrypoint:
 	if cached, ok := m.degradeQuery(degradeRecord); ok {
-		msg := MakeMessage(r, cached[:len(cached)-len(extras)]) // Answers
-		msg.Extra = cached[len(cached)-len(extras):]            // Extras
+		msg := MakeMessage(r, cached.answers)
+		msg.Extra = cached.extras
+		logger.Debugf("Serving from cache: %d answers, %d extras", len(cached.answers), len(cached.extras))
 		err = w.WriteMsg(msg)
 		if err != nil {
 			logger.Error(err)

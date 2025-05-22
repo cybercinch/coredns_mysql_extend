@@ -10,38 +10,35 @@ import (
 
 type Mysql struct {
 	*mysqlConfig
-
 	degradeCache map[record]dnsRecordInfo
 	zoneMap      map[string]int
-
-	Next plugin.Handler
-	db   *sql.DB
+	Next         plugin.Handler
+	db           *sql.DB
 }
 
 type pureRecord map[string][]string
 
 type mysqlConfig struct {
-	dsn          string
-	dumpFile     string
-	ttl          uint32
-	zonesTable   string
-	recordsTable string
-
-	maxIdleConns    int
-	maxOpenConns    int
-	connMaxIdleTime time.Duration
-	connMaxLifetime time.Duration
-
+	dsn                  string
+	dumpFile             string
+	ttl                  uint32
+	zonesTable           string
+	recordsTable         string
+	maxIdleConns         int
+	maxOpenConns         int
+	connMaxIdleTime      time.Duration
+	connMaxLifetime      time.Duration
 	failHeartbeatTime    time.Duration
 	successHeartbeatTime time.Duration
-
-	queryZoneSQL   string
-	queryRecordSQL string
+	queryZoneSQL         string
+	queryRecordSQL       string
 }
 
+// Updated dnsRecordInfo to properly separate answers and extras (glue records)
 type dnsRecordInfo struct {
-	response  []dns.RR
 	rrStrings []string
+	answers   []dns.RR
+	extras    []dns.RR
 }
 
 type zoneRecord struct {
