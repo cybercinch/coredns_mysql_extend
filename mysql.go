@@ -93,16 +93,14 @@ func (m *Mysql) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) 
 			continue
 		}
 		answers = append(answers, rr)
+		// Handle NS records
 		if rr.Header().Rrtype == dns.TypeNS {
 			ns := rr.(*dns.NS).Ns
-			// Check if NS target is in the same zone
-			if strings.HasSuffix(ns, "."+zone) || ns == zone {
-				// Get just the host part (without zone)
-				nsHost := strings.TrimSuffix(ns, "."+zone)
-				nsHost = strings.TrimSuffix(nsHost, ".")
 
+			// NEW: Check if this nameserver exists in ANY zone we manage
+			if nsZoneID, nsHost, nsZone, err := m.getDomainInfo(ns); err == nil {
 				// Look up A records
-				aRecords, err := m.getRecords(zoneID, nsHost, zone, "A")
+				aRecords, err := m.getRecords(nsZoneID, nsHost, nsZone, "A")
 				if err == nil {
 					for _, aRec := range aRecords {
 						aRRString := fmt.Sprintf("%s %d IN A %s", ns, aRec.ttl, aRec.data)
@@ -115,7 +113,7 @@ func (m *Mysql) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) 
 				}
 
 				// Look up AAAA records
-				aaaaRecords, err := m.getRecords(zoneID, nsHost, zone, "AAAA")
+				aaaaRecords, err := m.getRecords(nsZoneID, nsHost, nsZone, "AAAA")
 				if err == nil {
 					for _, aaaaRec := range aaaaRecords {
 						aaaaRRString := fmt.Sprintf("%s %d IN AAAA %s", ns, aaaaRec.ttl, aaaaRec.data)
@@ -129,7 +127,6 @@ func (m *Mysql) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) 
 			}
 		}
 	}
-
 	// Handle wildcard domains
 	if len(answers) == zero && strings.Count(qName, zoneSeparator) > 1 {
 		baseZone := m.getBaseZone(qName)
