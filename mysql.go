@@ -21,6 +21,7 @@ func (m *Mysql) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) 
 	var records []record
 	state := request.Request{W: w, Req: r}
 	answers := make([]dns.RR, 0)
+	extras := make([]dns.RR, 0) // New slice for glue records
 	rrStrings := make([]string, 0)
 
 	// Get domain name
@@ -92,6 +93,41 @@ func (m *Mysql) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) 
 			continue
 		}
 		answers = append(answers, rr)
+		if rr.Header().Rrtype == dns.TypeNS {
+			ns := rr.(*dns.NS).Ns
+			// Check if NS target is in the same zone
+			if strings.HasSuffix(ns, "."+zone) || ns == zone {
+				// Get just the host part (without zone)
+				nsHost := strings.TrimSuffix(ns, "."+zone)
+				nsHost = strings.TrimSuffix(nsHost, ".")
+
+				// Look up A records
+				aRecords, err := m.getRecords(zoneID, nsHost, zone, "A")
+				if err == nil {
+					for _, aRec := range aRecords {
+						aRRString := fmt.Sprintf("%s %d IN A %s", ns, aRec.ttl, aRec.data)
+						aRR, err := m.makeAnswer(aRRString)
+						if err == nil {
+							extras = append(extras, aRR)
+							rrStrings = append(rrStrings, aRRString)
+						}
+					}
+				}
+
+				// Look up AAAA records
+				aaaaRecords, err := m.getRecords(zoneID, nsHost, zone, "AAAA")
+				if err == nil {
+					for _, aaaaRec := range aaaaRecords {
+						aaaaRRString := fmt.Sprintf("%s %d IN AAAA %s", ns, aaaaRec.ttl, aaaaRec.data)
+						aaaaRR, err := m.makeAnswer(aaaaRRString)
+						if err == nil {
+							extras = append(extras, aaaaRR)
+							rrStrings = append(rrStrings, aaaaRRString)
+						}
+					}
+				}
+			}
+		}
 	}
 
 	// Handle wildcard domains
@@ -123,6 +159,8 @@ func (m *Mysql) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) 
 	// Common Entrypoint
 	if len(answers) > zero {
 		msg := MakeMessage(r, answers)
+		// NEW: Add glue records to the additional section
+		msg.Extra = extras
 		err = w.WriteMsg(msg)
 		if err != nil {
 			logger.Error(err)
@@ -136,6 +174,7 @@ func (m *Mysql) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) 
 		}
 		return dns.RcodeSuccess, nil
 	}
+
 	logger.Debug("Call next plugin")
 	return plugin.NextOrFailure(m.Name(), m.Next, ctx, w, r)
 
