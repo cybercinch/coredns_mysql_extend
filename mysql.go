@@ -97,31 +97,25 @@ func (m *Mysql) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) 
 		if rr.Header().Rrtype == dns.TypeNS {
 			ns := rr.(*dns.NS).Ns
 
-			// Look up the nameserver's zone
+			// NEW: Completely separate lookup for glue records
+			// First get the nameserver's zone info
 			if nsZoneID, nsHost, nsZone, err := m.getDomainInfo(ns); err == nil {
-				// NEW: Get the actual TTL from the nameserver's zone records
-				aRecords, err := m.getRecords(nsZoneID, nsHost, nsZone, "A")
+				// NEW: Directly query for A/AAAA records without relation to original query
+				glueRecords, err := m.getRecords(nsZoneID, nsHost, nsZone, "")
 				if err == nil {
-					for _, aRec := range aRecords {
-						// Use the TTL from the nameserver's A record, not the NS record's TTL
-						aRRString := fmt.Sprintf("%s %d IN A %s", ns, aRec.ttl, aRec.data)
-						aRR, err := m.makeAnswer(aRRString)
-						if err == nil {
-							extras = append(extras, aRR)
-							rrStrings = append(rrStrings, aRRString)
-						}
-					}
-				}
-
-				aaaaRecords, err := m.getRecords(nsZoneID, nsHost, nsZone, "AAAA")
-				if err == nil {
-					for _, aaaaRec := range aaaaRecords {
-						// Use the TTL from the nameserver's AAAA record
-						aaaaRRString := fmt.Sprintf("%s %d IN AAAA %s", ns, aaaaRec.ttl, aaaaRec.data)
-						aaaaRR, err := m.makeAnswer(aaaaRRString)
-						if err == nil {
-							extras = append(extras, aaaaRR)
-							rrStrings = append(rrStrings, aaaaRRString)
+					for _, glueRec := range glueRecords {
+						// Only include A/AAAA records
+						if glueRec.qType == "A" || glueRec.qType == "AAAA" {
+							glueRRString := fmt.Sprintf("%s %d IN %s %s",
+								glueRec.fqdn,
+								glueRec.ttl, // Use the record's own TTL
+								glueRec.qType,
+								glueRec.data)
+							glueRR, err := m.makeAnswer(glueRRString)
+							if err == nil {
+								extras = append(extras, glueRR)
+								rrStrings = append(rrStrings, glueRRString)
+							}
 						}
 					}
 				}
