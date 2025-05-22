@@ -83,26 +83,27 @@ func (m *Mysql) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) 
 			}
 		}
 	}
-
 	// Process records
 	for _, record := range records {
 		rrString := fmt.Sprintf("%s %d IN %s %s", record.fqdn, record.ttl, record.qType, record.data)
-		rrStrings = append(rrStrings, rrString)
 		rr, err := m.makeAnswer(rrString)
 		if err != nil {
 			continue
 		}
 		answers = append(answers, rr)
+		rrStrings = append(rrStrings, rrString)
+
 		// Handle NS records
 		if rr.Header().Rrtype == dns.TypeNS {
 			ns := rr.(*dns.NS).Ns
 
-			// NEW: Check if this nameserver exists in ANY zone we manage
+			// Look up the nameserver's zone
 			if nsZoneID, nsHost, nsZone, err := m.getDomainInfo(ns); err == nil {
-				// Look up A records
+				// NEW: Get the actual TTL from the nameserver's zone records
 				aRecords, err := m.getRecords(nsZoneID, nsHost, nsZone, "A")
 				if err == nil {
 					for _, aRec := range aRecords {
+						// Use the TTL from the nameserver's A record, not the NS record's TTL
 						aRRString := fmt.Sprintf("%s %d IN A %s", ns, aRec.ttl, aRec.data)
 						aRR, err := m.makeAnswer(aRRString)
 						if err == nil {
@@ -112,10 +113,10 @@ func (m *Mysql) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) 
 					}
 				}
 
-				// Look up AAAA records
 				aaaaRecords, err := m.getRecords(nsZoneID, nsHost, nsZone, "AAAA")
 				if err == nil {
 					for _, aaaaRec := range aaaaRecords {
+						// Use the TTL from the nameserver's AAAA record
 						aaaaRRString := fmt.Sprintf("%s %d IN AAAA %s", ns, aaaaRec.ttl, aaaaRec.data)
 						aaaaRR, err := m.makeAnswer(aaaaRRString)
 						if err == nil {
@@ -127,6 +128,7 @@ func (m *Mysql) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) 
 			}
 		}
 	}
+
 	// Handle wildcard domains
 	if len(answers) == zero && strings.Count(qName, zoneSeparator) > 1 {
 		baseZone := m.getBaseZone(qName)
