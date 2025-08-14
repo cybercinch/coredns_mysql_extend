@@ -10,10 +10,11 @@ import (
 
 type Mysql struct {
 	*mysqlConfig
-	degradeCache map[record]dnsRecordInfo
-	zoneMap      map[string]int
-	Next         plugin.Handler
-	db           *sql.DB
+	degradeCache      map[record]dnsRecordInfo
+	zoneMap           map[string]int
+	Next              plugin.Handler
+	db                *sql.DB
+	shouldFallthrough bool
 }
 
 type pureRecord map[string][]string
