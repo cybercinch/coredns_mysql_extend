@@ -55,6 +55,8 @@ func (m *Mysql) parseConfig(c *caddy.Controller) error {
 				} else {
 					m.ttl = uint32(userTTL)
 				}
+			case "fallthrough":
+				m.shouldFallthrough = true
 			case "zones_table":
 				if !c.NextArg() {
 					return c.ArgErr()
