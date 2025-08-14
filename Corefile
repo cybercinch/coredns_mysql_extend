@@ -1,0 +1,10 @@
+.:1053 {
+   reload
+   mysql {
+        dsn "coredns:fOfEVeNom88I!@tcp(10.0.0.80:3306)/coredns"
+        dump_file "/tmp/coredns_mysql_cache.json"
+   }
+    log
+    errors
+    debug
+}
