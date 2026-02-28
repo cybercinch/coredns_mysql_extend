@@ -20,8 +20,11 @@ The mysql_extend plugin provides a production-ready MySQL backend for CoreDNS wi
 
 **High Availability & Performance:**
 - ✅ **Connection Pooling** - Configurable MySQL connection management
-- ✅ **Degraded Operation** - Automatic fallback to JSON cache when MySQL is unavailable  
-- ✅ **Smart Caching** - Intelligent cache management with record separation
+- ✅ **Degraded Operation** - Automatic fallback to JSON cache when MySQL is unavailable
+- ✅ **Per-Zone Cache Files** - Each zone gets its own JSON file; corruption is isolated
+- ✅ **Periodic Cache Flush** - Cache written to disk on a configurable interval, not only on shutdown
+- ✅ **Self-Healing Cache** - Corrupt or missing zone files are automatically repaired when the DB comes back
+- ✅ **Thread-Safe** - Full `sync.RWMutex` protection on all shared state; safe under `-race`
 - ✅ **Health Monitoring** - Continuous database health checks with configurable intervals
 - ✅ **Zero Downtime** - DNS continues serving during database maintenance
 
@@ -32,7 +35,26 @@ The mysql_extend plugin provides a production-ready MySQL backend for CoreDNS wi
 - ✅ **Multi-Architecture** - Build support for AMD64, ARM64, Darwin, Windows
 - ✅ **Hot Reload** - Configuration changes without service restart
 
-## Latest Updates (2025-08-14)
+## Latest Updates (2026-02-28)
+
+🔒 **Fix: Concurrent Map Access Data Races**
+- Added `sync.RWMutex` to both `degradeCache` and `zoneMap`
+- All read paths use `RLock`, all write paths use `Lock`
+- Plugin now passes `go test -race` cleanly under concurrent DNS load
+
+📦 **Feat: Overhauled Degrade Cache**
+- **Per-zone JSON files** — `dump_dir` config splits cache into one file per zone; a corrupt file for one zone no longer affects others
+- **Periodic flush** — `dump_interval` (default `5m`) writes cache to disk on a ticker so a crash or hard kill loses at most one interval of data rather than everything since startup
+- **Faithful serialisation** — new `cacheEntry` format stores `answers` and `extras` as separate lists, eliminating the fragile heuristic that previously tried to reconstruct the split from raw RR strings on load
+- **Self-healing** — corrupt zone files are skipped cleanly on startup; once the DB is back, the first successful query re-populates the cache and the next flush overwrites the bad file automatically
+
+🧪 **Test: Comprehensive Test Coverage**
+- Concurrency tests (run with `go test -race ./...`) validate both mutex guards under 100 concurrent goroutines
+- Serialisation round-trip tests confirm `dump→load` preserves all records and the `answers/extras` split exactly
+- Repair cycle tests prove the four-stage self-healing flow end-to-end in both single-file and per-zone modes
+- Isolation tests confirm a corrupt zone file does not prevent other zones from loading
+
+## Previous Updates (2025-08-14)
 
 🎯 **Major Enhancement: BIND-Compatible Responses**
 - Added proper Authority section with NS records in all responses
@@ -84,23 +106,28 @@ just dev
 example.com:53 {
     mysql {
         dsn "username:password@tcp(mysql-host:3306)/dns"
-        dump_file "/tmp/dns_cache.json"
+
+        # Degraded operation cache — choose one mode:
+        dump_file "/tmp/dns_cache.json"       # single-file mode (default)
+        # dump_dir "/var/lib/coredns/cache"   # per-zone file mode (recommended)
+        dump_interval 5m                       # flush interval (default: 5m)
+
         ttl 360
         zones_table "zones"
         records_table "records"
         fallthrough
-        
+
         # Connection Pool Settings
         db_max_idle_conns 4
         db_max_open_conns 8
         db_conn_max_idle_time 1h
         db_conn_max_life_time 24h
-        
+
         # Health Check Settings
         fail_heartbeat_time 10s
         success_heartbeat_time 60s
     }
-    
+
     # Enable debug logging for troubleshooting
     debug
     log
@@ -113,7 +140,9 @@ example.com:53 {
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `dsn` | String | Required | MySQL connection string ([format](https://github.com/go-sql-driver/mysql#dsn-data-source-name)) |
-| `dump_file` | String | `dump_dns.json` | JSON fallback file for degraded operation |
+| `dump_file` | String | `dump_dns.json` | Single-file JSON cache for degraded operation |
+| `dump_dir` | String | _(unset)_ | Directory for per-zone JSON cache files; takes precedence over `dump_file` when set |
+| `dump_interval` | Duration | `5m` | How often the cache is flushed to disk while running |
 | `ttl` | Integer | `360` | Default TTL when database value ≤ 0 |
 | `zones_table` | String | `zones` | Zones table name |
 | `records_table` | String | `records` | Records table name |
@@ -240,6 +269,51 @@ INSERT INTO records (zone_id, hostname, type, data, ttl, online) VALUES
     (1, '@', 'CAA', '0 issuewild ";"', 300, 1);
 ```
 
+## Degraded Operation & Cache
+
+When MySQL is unavailable the plugin serves DNS from an in-memory cache that is backed by JSON files on disk.
+
+### Cache Modes
+
+**Single-file mode** (default, backward compatible):
+```
+dump_file "/tmp/dns_cache.json"
+```
+All zones are written to one file. Suitable for small deployments.
+
+**Per-zone mode** (recommended for production):
+```
+dump_dir  "/var/lib/coredns/cache"
+dump_interval 5m
+```
+Each zone gets its own `<zone>.json` file inside `dump_dir`. Benefits:
+- A corrupt file for one zone does not affect other zones
+- Smaller individual files mean faster reads on restart
+- Easier to inspect or manually correct a single zone
+
+### Self-Healing
+
+If a zone file is corrupt or missing on startup the cache starts empty for that zone. As soon as the database comes back:
+1. Successful DB queries repopulate the in-memory cache automatically
+2. The next `dump_interval` tick writes valid JSON, replacing the corrupt file
+3. On the subsequent restart the file loads cleanly
+
+No operator intervention is required.
+
+### TTL Recommendations
+
+TTL values are stored in the `ttl` column of the `records` table and served as-is. Recommended values for static infrastructure:
+
+| Record Type | Recommended TTL |
+|-------------|----------------|
+| NS | 86400 (24h) |
+| A / AAAA (static) | 3600 (1h) |
+| MX | 3600 (1h) |
+| CNAME | 3600 (1h) |
+| SOA negative TTL | 300–900 |
+
+> **Note for DirectAdmin users:** DA pushes a global default TTL (often 300s) to all records. If you are using a translation layer between DA and this plugin, apply per-type TTL overrides there before writing to MySQL rather than accepting the DA default.
+
 ## Monitoring & Observability
 
 ### Prometheus Metrics
@@ -346,6 +420,19 @@ just test-build           # Verify build success
 just multi-arch           # Build for all platforms
 just build-sizes          # Show binary sizes
 just verify-multi-arch    # Verify plugin in all builds
+```
+
+### Running Unit Tests
+
+```bash
+# Standard test run
+go test ./...
+
+# With race detector (recommended — validates all mutex guards)
+go test -race ./...
+
+# Verbose output showing all test names
+go test -race -v ./...
 ```
 
 ### Testing DNS Functionality
