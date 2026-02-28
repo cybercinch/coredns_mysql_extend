@@ -52,7 +52,9 @@ func (m *Mysql) reGetZone() {
 			}
 			zoneMap[zoneRecord.name] = zoneRecord.id
 		}
+		m.zoneMu.Lock()
 		m.zoneMap = zoneMap
+		m.zoneMu.Unlock()
 		logger.Debugf("Success to query zones: %#v", zoneMap)
 		dbGetZoneCount.With(prometheus.Labels{"status": "success"}).Inc()
 

@@ -49,7 +49,9 @@ func (m *Mysql) getDomainInfo(fqdn string) (int, string, string, error) {
 }
 
 func (m *Mysql) getZoneID(zone string) (int, bool) {
+	m.zoneMu.RLock()
 	id, ok := m.zoneMap[zone]
+	m.zoneMu.RUnlock()
 	return id, ok
 }
 
@@ -60,9 +62,10 @@ func (m *Mysql) getBaseZone(fqdn string) string {
 	return rootZone
 }
 
-// Updated degradeQuery method to work with new dnsRecordInfo structure
 func (m *Mysql) degradeQuery(record record) (dnsRecordInfo, bool) {
+	m.degradeMu.RLock()
 	dnsRecordInfo, ok := m.degradeCache[record]
+	m.degradeMu.RUnlock()
 	if !ok {
 		degradeCacheCount.With(prometheus.Labels{"option": "query", "status": "fail", "fqdn": record.fqdn, "qtype": record.qType}).Inc()
 	} else {
@@ -71,9 +74,10 @@ func (m *Mysql) degradeQuery(record record) (dnsRecordInfo, bool) {
 	return dnsRecordInfo, ok
 }
 
-// Updated degradeWrite method remains the same since it already takes dnsRecordInfo
 func (m *Mysql) degradeWrite(record record, dnsRecordInfo dnsRecordInfo) {
+	m.degradeMu.Lock()
 	m.degradeCache[record] = dnsRecordInfo
+	m.degradeMu.Unlock()
 }
 
 func (m *Mysql) getRecords(zoneID int, host, zone, qType string) ([]record, error) {

@@ -2,6 +2,7 @@ package coredns_mysql_extend
 
 import (
 	"database/sql"
+	"sync"
 	"time"
 
 	"github.com/coredns/coredns/plugin"
@@ -11,7 +12,9 @@ import (
 type Mysql struct {
 	*mysqlConfig
 	degradeCache      map[record]dnsRecordInfo
+	degradeMu         sync.RWMutex
 	zoneMap           map[string]int
+	zoneMu            sync.RWMutex
 	Next              plugin.Handler
 	db                *sql.DB
 	shouldFallthrough bool
