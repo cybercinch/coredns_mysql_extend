@@ -5,12 +5,21 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/miekg/dns"
 	"github.com/prometheus/client_golang/prometheus"
 )
+
+// cacheEntry is the on-disk representation of a single cache entry.
+// Storing answers and extras separately avoids the fragile heuristic
+// that previously tried to reconstruct the split from RR strings alone.
+type cacheEntry struct {
+	Answers []string `json:"answers"`
+	Extras  []string `json:"extras"`
+}
 
 func (m *Mysql) rePing() {
 	for {
@@ -62,90 +71,218 @@ func (m *Mysql) reGetZone() {
 	}
 }
 
-func (m *Mysql) loadLocalData() {
-	cache := make(map[record]dnsRecordInfo, zero)
-	m.degradeCache = cache
-	pureRecords := make([]pureRecord, zero)
-	content, err := os.ReadFile(m.dumpFile)
-	if err != nil {
-		logger.Errorf("Failed to load data from file: %s", err)
-		loadLocalData.With(prometheus.Labels{"status": "fail"}).Inc()
-		return
+// periodicDump flushes the degrade cache to disk on a fixed interval so that
+// a crash or hard kill does not lose all accumulated state.
+func (m *Mysql) periodicDump() {
+	ticker := time.NewTicker(m.dumpInterval)
+	defer ticker.Stop()
+	for range ticker.C {
+		logger.Debugf("Periodic cache flush triggered (interval=%s)", m.dumpInterval)
+		m.dump2LocalData()
 	}
-	err = json.Unmarshal(content, &pureRecords)
-	if err != nil {
-		logger.Errorf("Failed to load data from file: %s", err)
-		loadLocalData.With(prometheus.Labels{"status": "fail"}).Inc()
-		return
-	}
-
-	for _, rMap := range pureRecords {
-		for queryKey, rrStrings := range rMap {
-			var answers []dns.RR
-			var extras []dns.RR
-			queryKeySlice := strings.Split(queryKey, keySeparator)
-			fqdn, qType := queryKeySlice[0], queryKeySlice[1]
-			record := record{fqdn: fqdn, qType: qType}
-
-			for _, rrString := range rrStrings {
-				rr, err := dns.NewRR(rrString)
-				if err != nil {
-					continue
-				}
-
-				// Parse the RR string to determine if it's a glue record
-				// Glue records are typically A/AAAA records that don't match the query name
-				if rr.Header().Rrtype == dns.TypeA || rr.Header().Rrtype == dns.TypeAAAA {
-					// If the RR name doesn't match the query name, it's likely a glue record
-					if strings.ToLower(rr.Header().Name) != strings.ToLower(fqdn) {
-						extras = append(extras, rr)
-					} else {
-						answers = append(answers, rr)
-					}
-				} else {
-					// Non-A/AAAA records go to answers
-					answers = append(answers, rr)
-				}
-			}
-
-			// Create new dnsRecordInfo with separated answers and extras
-			dnsRecordInfo := dnsRecordInfo{
-				rrStrings: rrStrings,
-				answers:   answers,
-				extras:    extras,
-			}
-			cache[record] = dnsRecordInfo
-		}
-	}
-	// TODO add lock
-	logger.Debugf("Load degrade data from local file %#v", cache)
-	loadLocalData.With(prometheus.Labels{"status": "success"}).Inc()
-	m.degradeCache = cache
 }
 
-func (m *Mysql) dump2LocalData() {
-	pureRecord := make([]pureRecord, zero)
-	for record, dnsRecordInfo := range m.degradeCache {
-		logger.Debugf("Record %#v", record)
-		pureRecord = append(pureRecord, map[string][]string{
-			fmt.Sprintf("%s%s%s", record.fqdn, keySeparator, record.qType): dnsRecordInfo.rrStrings,
-		})
+// zoneForFQDN returns the zone name (with trailing dot) that owns fqdn,
+// or an empty string when no match is found in zoneMap.
+func (m *Mysql) zoneForFQDN(fqdn string) string {
+	parts := strings.Split(strings.TrimSuffix(fqdn, "."), ".")
+	for i := range parts {
+		candidate := strings.Join(parts[i:], ".") + "."
+		if _, ok := m.zoneMap[candidate]; ok {
+			return candidate
+		}
+	}
+	return ""
+}
+
+// zoneFilePath returns the path to the JSON file for a given zone.
+// When dump_dir is configured it produces "<dump_dir>/<zone_no_dot>.json",
+// otherwise it falls back to dump_file (single-file mode).
+func (m *Mysql) zoneFilePath(zone string) string {
+	if m.dumpDir == "" {
+		return m.dumpFile
+	}
+	name := strings.TrimSuffix(zone, ".") + ".json"
+	return filepath.Join(m.dumpDir, name)
+}
+
+// loadLocalData reads the degrade cache from disk.
+// In per-zone mode it reads every *.json file under dump_dir.
+// In single-file mode it reads dump_file.
+func (m *Mysql) loadLocalData() {
+	cache := make(map[record]dnsRecordInfo)
+
+	if m.dumpDir != "" {
+		entries, err := os.ReadDir(m.dumpDir)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				logger.Errorf("Failed to read dump_dir %s: %s", m.dumpDir, err)
+			}
+			loadLocalData.With(prometheus.Labels{"status": "fail"}).Inc()
+			m.degradeMu.Lock()
+			m.degradeCache = cache
+			m.degradeMu.Unlock()
+			return
+		}
+		for _, entry := range entries {
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+				continue
+			}
+			path := filepath.Join(m.dumpDir, entry.Name())
+			m.loadZoneFile(path, cache)
+		}
+	} else {
+		m.loadZoneFile(m.dumpFile, cache)
 	}
 
-	content, err := json.Marshal(pureRecord)
+	logger.Debugf("Loaded %d degrade cache entries from disk", len(cache))
+	loadLocalData.With(prometheus.Labels{"status": "success"}).Inc()
+	m.degradeMu.Lock()
+	m.degradeCache = cache
+	m.degradeMu.Unlock()
+}
+
+// loadZoneFile deserialises one JSON cache file into the provided cache map.
+func (m *Mysql) loadZoneFile(path string, cache map[record]dnsRecordInfo) {
+	content, err := os.ReadFile(path)
 	if err != nil {
-		logger.Errorf("Failed to dump data to local: %s", err)
+		if !os.IsNotExist(err) {
+			logger.Errorf("Failed to read cache file %s: %s", path, err)
+		}
+		return
+	}
+
+	var zoneData map[string]cacheEntry
+	if err := json.Unmarshal(content, &zoneData); err != nil {
+		logger.Errorf("Failed to parse cache file %s: %s", path, err)
+		return
+	}
+
+	for key, entry := range zoneData {
+		parts := strings.SplitN(key, keySeparator, 2)
+		if len(parts) != 2 {
+			continue
+		}
+		fqdn, qType := parts[0], parts[1]
+		rec := record{fqdn: fqdn, qType: qType}
+
+		var answers []dns.RR
+		for _, s := range entry.Answers {
+			rr, err := dns.NewRR(s)
+			if err == nil {
+				answers = append(answers, rr)
+			}
+		}
+		var extras []dns.RR
+		for _, s := range entry.Extras {
+			rr, err := dns.NewRR(s)
+			if err == nil {
+				extras = append(extras, rr)
+			}
+		}
+
+		// Reconstruct rrStrings from both slices in original order
+		allStrings := append(entry.Answers, entry.Extras...)
+		cache[rec] = dnsRecordInfo{
+			rrStrings: allStrings,
+			answers:   answers,
+			extras:    extras,
+		}
+	}
+	logger.Debugf("Loaded cache file %s (%d entries)", path, len(zoneData))
+}
+
+// dump2LocalData serialises the degrade cache to disk.
+// In per-zone mode, entries are grouped by zone and each zone gets its own file.
+// In single-file mode, all entries go into dump_file.
+func (m *Mysql) dump2LocalData() {
+	m.degradeMu.RLock()
+	// Snapshot the cache so we hold the lock as briefly as possible.
+	snapshot := make(map[record]dnsRecordInfo, len(m.degradeCache))
+	for k, v := range m.degradeCache {
+		snapshot[k] = v
+	}
+	m.degradeMu.RUnlock()
+
+	if m.dumpDir != "" {
+		m.dumpPerZone(snapshot)
+	} else {
+		m.dumpSingleFile(snapshot)
+	}
+}
+
+func (m *Mysql) dumpPerZone(snapshot map[record]dnsRecordInfo) {
+	if err := os.MkdirAll(m.dumpDir, 0750); err != nil {
+		logger.Errorf("Failed to create dump_dir %s: %s", m.dumpDir, err)
 		dumpLocalData.With(prometheus.Labels{"status": "fail"}).Inc()
 		return
 	}
-	if err := os.WriteFile(m.dumpFile, content, safeMode); err != nil {
-		logger.Error(err)
-		logger.Errorf("Failed to dump data to local: %s", err)
+
+	// Group entries by zone.
+	byZone := make(map[string]map[string]cacheEntry)
+	for rec, info := range snapshot {
+		zone := m.zoneForFQDN(rec.fqdn)
+		if zone == "" {
+			zone = "unknown"
+		}
+		if byZone[zone] == nil {
+			byZone[zone] = make(map[string]cacheEntry)
+		}
+		key := fmt.Sprintf("%s%s%s", rec.fqdn, keySeparator, rec.qType)
+		byZone[zone][key] = rrStringsToCacheEntry(info)
+	}
+
+	allOk := true
+	for zone, zoneData := range byZone {
+		path := m.zoneFilePath(zone)
+		if err := writeJSON(path, zoneData); err != nil {
+			logger.Errorf("Failed to write zone cache %s: %s", path, err)
+			allOk = false
+		} else {
+			logger.Debugf("Wrote zone cache %s (%d entries)", path, len(zoneData))
+		}
+	}
+
+	if allOk {
+		dumpLocalData.With(prometheus.Labels{"status": "success"}).Inc()
+	} else {
+		dumpLocalData.With(prometheus.Labels{"status": "fail"}).Inc()
+	}
+}
+
+func (m *Mysql) dumpSingleFile(snapshot map[record]dnsRecordInfo) {
+	data := make(map[string]cacheEntry, len(snapshot))
+	for rec, info := range snapshot {
+		key := fmt.Sprintf("%s%s%s", rec.fqdn, keySeparator, rec.qType)
+		data[key] = rrStringsToCacheEntry(info)
+	}
+	if err := writeJSON(m.dumpFile, data); err != nil {
+		logger.Errorf("Failed to dump cache to %s: %s", m.dumpFile, err)
 		dumpLocalData.With(prometheus.Labels{"status": "fail"}).Inc()
 		return
 	}
-	logger.Debugf("Success to dump data to local: %#v", pureRecord)
+	logger.Debugf("Wrote single-file cache %s (%d entries)", m.dumpFile, len(data))
 	dumpLocalData.With(prometheus.Labels{"status": "success"}).Inc()
+}
+
+func rrStringsToCacheEntry(info dnsRecordInfo) cacheEntry {
+	answerStrings := make([]string, 0, len(info.answers))
+	for _, rr := range info.answers {
+		answerStrings = append(answerStrings, rr.String())
+	}
+	extraStrings := make([]string, 0, len(info.extras))
+	for _, rr := range info.extras {
+		extraStrings = append(extraStrings, rr.String())
+	}
+	return cacheEntry{Answers: answerStrings, Extras: extraStrings}
+}
+
+func writeJSON(path string, v interface{}) error {
+	content, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, content, safeMode)
 }
 
 func (m *Mysql) openDB() (*sql.DB, error) {
@@ -167,18 +304,13 @@ func (m *Mysql) openDB() (*sql.DB, error) {
 
 func (m *Mysql) onStartup() error {
 	logger.Debug("On start up")
-	// Initialize database connection pool
 	db, _ := m.openDB()
-
 	m.db = db
 
-	// Start rePing loop
 	go m.rePing()
-	// start reGetZone loop
 	go m.reGetZone()
-	// Load local file data
 	m.loadLocalData()
-	// Create tables
+	go m.periodicDump()
 	m.createTables()
 	return nil
 }
@@ -188,7 +320,6 @@ func (m *Mysql) onShutdown() error {
 	if m.db != nil {
 		m.db.Close()
 	}
-	// Dump memory data to local file
 	m.dump2LocalData()
 	return nil
 }

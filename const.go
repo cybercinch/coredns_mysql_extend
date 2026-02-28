@@ -5,6 +5,8 @@ import "time"
 const (
 	defaultDSN                  = "username:password@tcp(127.0.0.1:3306)/dns"
 	defaultDumpFile             = "dump_dns.json"
+	defaultDumpDir              = ""
+	defaultDumpInterval         = time.Minute * 5
 	defaultTTL                  = 360
 	defaultZonesTable           = "zones"
 	defaultRecordsTable         = "records"

@@ -25,6 +25,8 @@ type pureRecord map[string][]string
 type mysqlConfig struct {
 	dsn                  string
 	dumpFile             string
+	dumpDir              string
+	dumpInterval         time.Duration
 	ttl                  uint32
 	zonesTable           string
 	recordsTable         string

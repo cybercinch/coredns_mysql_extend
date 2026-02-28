@@ -16,6 +16,8 @@ func (m *Mysql) parseConfig(c *caddy.Controller) error {
 	mysqlConfig := &mysqlConfig{
 		dsn:          defaultDSN,
 		dumpFile:     defaultDumpFile,
+		dumpDir:      defaultDumpDir,
+		dumpInterval: defaultDumpInterval,
 		ttl:          defaultTTL,
 		zonesTable:   defaultZonesTable,
 		recordsTable: defaultRecordsTable,
@@ -45,6 +47,21 @@ func (m *Mysql) parseConfig(c *caddy.Controller) error {
 					return c.ArgErr()
 				}
 				m.dumpFile = c.Val()
+			case "dump_dir":
+				if !c.NextArg() {
+					return c.ArgErr()
+				}
+				m.dumpDir = c.Val()
+			case "dump_interval":
+				if !c.NextArg() {
+					return c.ArgErr()
+				}
+				userDumpInterval, err := time.ParseDuration(c.Val())
+				if err != nil || userDumpInterval <= zeroTime {
+					m.dumpInterval = defaultDumpInterval
+				} else {
+					m.dumpInterval = userDumpInterval
+				}
 			case "ttl":
 				if !c.NextArg() {
 					return c.ArgErr()
